@@ -9,7 +9,7 @@ from urllib.parse import unquote
 import zipfile
 
 # === PUT YOUR TOKEN HERE OR USE ENVIRONMENT VARIABLE (Railway) ===
-TOKEN = os.getenv('TOKEN', '7880620831:AAE-pjgq2FU0YNJ7sGakn0GHT9E0DvmQCvc')  # Railway uses env var
+TOKEN = os.getenv('TOKEN', '7880620831:AAE-pjgq2FU0YNJ7sGakn0GHT9E0DvmQCvc')  # Remove hardcoded token for security!
 bot = telebot.TeleBot(TOKEN)
 
 # Temporary folder
@@ -67,6 +67,8 @@ def handle_message(message):
                 'merge_output_format': 'mp4',
                 'quiet': True,
                 'no_warnings': True,
+                # NEW: Cookie support for sensitive videos
+                'cookiefile': 'cookies.txt',  # Path to your exported cookies file
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
@@ -84,7 +86,7 @@ def handle_message(message):
         bot.delete_message(message.chat.id, status_msg.message_id)
 
     except Exception as e:
-        bot.reply_to(message, f"Failed to download.\nError: {str(e)}")
+        bot.reply_to(message, f"Failed to download.\nError: {str(e)}\n\n💡 If sensitive content, ensure cookies.txt is set up!")
         print("ERROR:", e)
 
 # ==================== PHOTO DOWNLOADER ====================
