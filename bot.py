@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import unquote
 import zipfile
 
-TOKEN = os.getenv('TOKEN', 'YOUR_BOT_TOKEN_HERE')  # ← REMOVE YOUR REAL TOKEN HERE BEFORE PUSHING!
+TOKEN = os.getenv('TOKEN', '7880620831:AAE-pjgq2FU0YNJ7sGakn0GHT9E0DvmQCvc')  # ← REMOVE YOUR REAL TOKEN HERE BEFORE PUSHING!
 bot = telebot.TeleBot(TOKEN)
 
 if not os.path.exists('downloads'):
