@@ -13,7 +13,7 @@ from datetime import datetime
 import json
 
 # === TOKEN ===
-TOKEN = os.getenv('7880620831:AAE-pjgq2FU0YNJ7sGakn0GHT9E0DvmQCvc')
+TOKEN = os.getenv('TOKEN')
 bot = telebot.TeleBot(TOKEN)
 
 # === GOOGLE SHEETS LOGGING (secure – no file needed) ===
