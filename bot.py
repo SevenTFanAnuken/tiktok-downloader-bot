@@ -12,41 +12,30 @@ from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import json
 
-# === TOKEN (MUST be set in Railway Variables as "TOKEN") ===
+# === TOKEN ===
 TOKEN = os.getenv('TOKEN')
 if not TOKEN:
-    print("FATAL: TOKEN not found! Add it in Railway Variables")
+    print("FATAL: TOKEN not found!")
     exit()
 bot = telebot.TeleBot(TOKEN)
 
-# === GOOGLE SHEETS LOGGING (WITH FULL DEBUG) ===
+# === GOOGLE SHEETS LOGGING ===
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds_json = os.getenv('GOOGLE_CREDENTIALS')
 
-if not creds_json:
-    print("ERROR: GOOGLE_CREDENTIALS variable is missing or empty!")
-    logging_enabled = False
-else:
-    print("GOOGLE_CREDENTIALS found – length:", len(creds_json))
+if creds_json:
     try:
-        creds_dict = json.loads(creds_json)
-        print("JSON parsed successfully")
-        print("Project ID:", creds_dict.get("project_id"))
-        print("Client email:", creds_dict.get("client_email"))
-
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json), scope)
         gc = gspread.authorize(creds)
-        print("Authorized with Google successfully")
-
-        # ←←←←← CHANGE THIS TO YOUR EXACT SHEET NAME (case-sensitive!) ←←←←←
-        sheet = gc.open("TiktokData").sheet1   # ←←← CHANGE THIS LINE!
-        
-        print("Opened sheet successfully:", sheet.title)
+        sheet = gc.open("TiktokData").sheet1  # Your sheet name
         logging_enabled = True
-        print("Google Sheets logging FULLY ENABLED")
+        print("Google Sheets logging ENABLED")
     except Exception as e:
-        print("Google Sheets setup FAILED:", str(e))
+        print("Google Sheets failed:", e)
         logging_enabled = False
+else:
+    print("No GOOGLE_CREDENTIALS → logging disabled")
+    logging_enabled = False
 
 def log_usage(user, url, status="Success"):
     if not logging_enabled:
@@ -62,34 +51,56 @@ def log_usage(user, url, status="Success"):
             status
         ]
         sheet.append_row(row)
-        print("Logged to Google Sheet:", row)
     except Exception as e:
-        print("Failed to write to sheet:", str(e))
+        print("Sheet write failed:", e)
 
 # Temporary folder
 if not os.path.exists('downloads'):
     os.makedirs('downloads')
 
-@bot.message_handler(commands=['start', 'help'])
+# ==================== COMMANDS ====================
+
+@bot.message_handler(commands=['start'])
 def send_welcome(message):
-    bot.reply_to(message, "TikTok Downloader Bot\n\n"
-                         "Send any TikTok link → I’ll download it + log to Google Sheets!")
+    bot.reply_to(message, "Bot is waiting for the link\n\n"
+                          "Just send any TikTok link and I will download it for you!")
+
+@bot.message_handler(commands=['help'])
+def send_help(message):
+    help_text = (
+        "Available Commands:\n\n"
+        "/start - Show welcome message\n"
+        "/help  - Show this help\n"
+        "/issue - Contact the developer\n\n"
+        "Just paste any TikTok link (video or photo) and I’ll send it back without watermark!"
+    )
+    bot.reply_to(message, help_text)
+
+@bot.message_handler(commands=['issue'])
+def send_issue(message):
+    bot.reply_to(message, "Found a bug or have a suggestion?\n"
+                          "Contact the developer: @mnchetra")
+
+# ==================== MAIN HANDLER ====================
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     url = message.text.strip()
+    
     if "tiktok.com" not in url:
         bot.reply_to(message, "Please send a valid TikTok link!")
         return
 
+    # Log when link received
     log_usage(message.from_user, url, "Received")
-    status_msg = bot.reply_to(message, "Processing...")
+    status_msg = bot.reply_to(message, "Downloading...")
 
     try:
         unique_id = str(uuid.uuid4())
         temp_path = f"downloads/{unique_id}"
 
         if "/photo/" in url:
+            # === PHOTO DOWNLOAD ===
             bot.edit_message_text("Downloading photo(s)...", message.chat.id, status_msg.message_id)
             files = download_tiktok_photo(url, temp_path)
             if not files:
@@ -102,11 +113,13 @@ def handle_message(message):
                     os.remove(f)
 
             with open(zip_path, 'rb') as z:
-                bot.send_document(message.chat.id, z, caption="Your TikTok photos + music")
+                # Caption = the original link
+                bot.send_document(message.chat.id, z, caption=url)
             os.remove(zip_path)
             log_usage(message.from_user, url, "Photo Sent")
 
         else:
+            # === VIDEO DOWNLOAD ===
             bot.edit_message_text("Downloading video...", message.chat.id, status_msg.message_id)
             ydl_opts = {
                 'outtmpl': f'{temp_path}.%(ext)s',
@@ -123,7 +136,8 @@ def handle_message(message):
                 if file.startswith(unique_id):
                     path = os.path.join('downloads', file)
                     with open(path, 'rb') as video:
-                        bot.send_video(message.chat.id, video, caption="Your TikTok video (no watermark)!")
+                        # Caption = the original TikTok link
+                        bot.send_video(message.chat.id, video, caption=url)
                     os.remove(path)
                     log_usage(message.from_user, url, "Video Sent")
                     break
@@ -131,11 +145,11 @@ def handle_message(message):
         bot.delete_message(message.chat.id, status_msg.message_id)
 
     except Exception as e:
-        bot.reply_to(message, f"Failed: {str(e)}")
-        log_usage(message.from_user, url, f"Failed: {str(e)[:50]}")
+        bot.reply_to(message, f"Download failed: {str(e)}")
+        log_usage(message.from_user, url, f"Failed")
         print("ERROR:", e)
 
-# === PHOTO DOWNLOADER (keep your working version) ===
+# === PHOTO DOWNLOADER FUNCTION ===
 def download_tiktok_photo(url, base_path):
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
@@ -180,5 +194,5 @@ def download_tiktok_photo(url, base_path):
                     except: pass
     return downloaded
 
-print("Bot started – waiting for links...")
+print("Bot started – waiting for TikTok links...")
 bot.infinity_polling()
