@@ -11,6 +11,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import json
+import time  # NEW: For retries
 
 # === TOKEN ===
 TOKEN = os.getenv('TOKEN')
@@ -27,7 +28,7 @@ if creds_json:
     try:
         creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json), scope)
         gc = gspread.authorize(creds)
-        sheet = gc.open("TiktokData").sheet1  # Your sheet name
+        sheet = gc.open("TiktokData").sheet1
         logging_enabled = True
         print("Google Sheets logging ENABLED")
     except Exception as e:
@@ -72,7 +73,7 @@ def send_help(message):
         "/start - Show welcome message\n"
         "/help  - Show this help\n"
         "/issue - Contact the developer\n\n"
-        "Just paste any TikTok link (video or photo) and I’ll send it back without watermark!"
+        "Just paste any TikTok link (video or photo) and I'll send it back without watermark!"
     )
     bot.reply_to(message, help_text)
 
@@ -113,45 +114,61 @@ def handle_message(message):
                     os.remove(f)
 
             with open(zip_path, 'rb') as z:
-                # Caption = the original link
                 bot.send_document(message.chat.id, z, caption=url)
             os.remove(zip_path)
             log_usage(message.from_user, url, "Photo Sent")
 
         else:
-            # === VIDEO DOWNLOAD ===
-            bot.edit_message_text("Downloading video...", message.chat.id, status_msg.message_id)
-            ydl_opts = {
-                'outtmpl': f'{temp_path}.%(ext)s',
-                'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
-                'merge_output_format': 'mp4',
-                'quiet': True,
-                'cookiefile': 'cookies.txt',
-                'user_agent': 'Mozilla/5.0',
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+            # === VIDEO DOWNLOAD (WITH RETRIES) ===
+            success = False
+            for attempt in range(3):  # NEW: Retry up to 3 times
+                try:
+                    bot.edit_message_text(f"Downloading video... (attempt {attempt+1}/3)", message.chat.id, status_msg.message_id)
+                    ydl_opts = {
+                        'outtmpl': f'{temp_path}.%(ext)s',
+                        'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',  # Flexible
+                        'merge_output_format': 'mp4',
+                        'quiet': True,  # Less noise
+                        'no_warnings': True,
+                        'cookiefile': 'cookies.txt',
+                        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'referer': 'https://www.tiktok.com/',
+                        'sleep_interval': 2,  # NEW: Wait 2s between requests (bypasses "Please wait...")
+                        'extractor_retries': 3,  # NEW: Retry extraction
+                        'retry_sleep': 1,  # NEW: Sleep 1s on retry
+                    }
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([url])
 
-            for file in os.listdir('downloads'):
-                if file.startswith(unique_id):
-                    path = os.path.join('downloads', file)
-                    with open(path, 'rb') as video:
-                        # Caption = the original TikTok link
-                        bot.send_video(message.chat.id, video, caption=url)
-                    os.remove(path)
-                    log_usage(message.from_user, url, "Video Sent")
-                    break
+                    # Find and send file
+                    for file in os.listdir('downloads'):
+                        if file.startswith(unique_id):
+                            path = os.path.join('downloads', file)
+                            with open(path, 'rb') as video:
+                                bot.send_video(message.chat.id, video, caption=url)
+                            os.remove(path)
+                            success = True
+                            log_usage(message.from_user, url, "Video Sent")
+                            break
+                    if success:
+                        break
+                    time.sleep(3)  # Wait before retry
+                except Exception as retry_e:
+                    print(f"Retry {attempt+1} failed: {retry_e}")
+                    if attempt == 2:
+                        raise retry_e
 
         bot.delete_message(message.chat.id, status_msg.message_id)
 
     except Exception as e:
-        bot.reply_to(message, f"Download failed: {str(e)}")
-        log_usage(message.from_user, url, f"Failed")
+        error_msg = f"Download failed: {str(e)}\n\nTry a different link or /issue for help!"
+        bot.reply_to(message, error_msg)
+        log_usage(message.from_user, url, f"Failed: {str(e)[:50]}")
         print("ERROR:", e)
 
-# === PHOTO DOWNLOADER FUNCTION ===
+# === PHOTO DOWNLOADER ===
 def download_tiktok_photo(url, base_path):
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     try:
         r = requests.get(url, headers=headers, timeout=15)
         r.raise_for_status()
