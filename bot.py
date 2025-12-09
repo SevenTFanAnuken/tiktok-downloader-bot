@@ -28,7 +28,7 @@ if creds_json:
     try:
         creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json), scope)
         gc = gspread.authorize(creds)
-        sh = gc.open("TiktokData")           # ← Change only if your sheet has a different name
+        sh = gc.open("Sheet1")           # ← Change only if your sheet has a different name
         sheet = sh.sheet1
 
         # AUTO-CREATE HEADERS IF MISSING OR WRONG
