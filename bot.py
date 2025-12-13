@@ -30,7 +30,16 @@ if creds_json:
         creds_dict = json.loads(creds_json)
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         gc = gspread.authorize(creds)
-        sheet = gc.open("TiktokData").sheet1          # ← Change if needed
+        sheet = gc.open("TiktokData").sheet1  # ← Change sheet name if needed
+
+        # AUTO-CREATE HEADERS IF MISSING
+        headers = ["Timestamp", "User ID", "Username", "First Name", "TikTok Link", "Type", "Status"]
+        current_headers = sheet.row_values(1)
+        if not current_headers or current_headers != headers:
+            sheet.clear()
+            sheet.append_row(headers)
+            print("Google Sheet headers created automatically!")
+
         logging_enabled = True
         print("Google Sheets logging ENABLED")
     except Exception as e:
@@ -59,8 +68,7 @@ def log_usage(user, url, status="Success"):
 os.makedirs('downloads', exist_ok=True)
 
 # === DUPLICATE PREVENTION CACHE ===
-# Format: {chat_id: {url: sent_message_id}}
-sent_cache = {}
+sent_cache = {}  # {chat_id: {url: sent_message_id}}
 
 # ====================== COMMANDS ======================
 
@@ -96,7 +104,7 @@ def handle_message(message):
 
     chat_id = message.chat.id
 
-    # Check for duplicate
+    # Anti-duplicate
     if chat_id in sent_cache and url in sent_cache[chat_id]:
         prev_msg_id = sent_cache[chat_id][url]
         bot.reply_to(message, "You already downloaded this one!", reply_to_message_id=prev_msg_id)
@@ -109,7 +117,6 @@ def handle_message(message):
     try:
         unique_id = str(uuid.uuid4())
         temp_path = f"downloads/{unique_id}"
-
         is_photo = "/photo/" in url
 
         if is_photo:
@@ -117,7 +124,7 @@ def handle_message(message):
             files = download_tiktok_photo(url, temp_path)
 
             if not files:
-                raise Exception("No media found in this slideshow")
+                raise Exception("No media found")
 
             zip_path = f"{temp_path}.zip"
             with zipfile.ZipFile(zip_path, 'w') as zf:
@@ -166,7 +173,7 @@ def handle_message(message):
             else:
                 raise Exception("Video file not found after download")
 
-        # Cache the sent message ID for this URL in this chat
+        # Cache sent message
         if chat_id not in sent_cache:
             sent_cache[chat_id] = {}
         sent_cache[chat_id][url] = sent_msg.message_id
@@ -174,14 +181,24 @@ def handle_message(message):
         bot.delete_message(chat_id, status_msg.message_id)
 
     except Exception as e:
-        error_text = str(e) if len(str(e)) < 100 else str(e)[:97] + "..."
+        error_text = str(e)[:97] + "..." if len(str(e)) > 100 else str(e)
         bot.edit_message_text(f"Failed: {error_text}\nTry again or use /issue", chat_id, status_msg.message_id)
         log_usage(message.from_user, url, f"Error: {error_text}")
         print("ERROR:", e)
 
-# ====================== PHOTO DOWNLOADER ======================
+# ====================== PHOTO DOWNLOADER (Primary + API Fallback) ======================
 
 def download_tiktok_photo(url, base_path):
+    # Primary: BeautifulSoup scraping
+    files = download_tiktok_photo_scrape(url, base_path)
+    if files:
+        return files
+
+    # Fallback: tikwm.com API (very reliable in 2025)
+    print("Primary photo scrape failed → trying tikwm.com API fallback")
+    return download_tiktok_photo_api(url, base_path)
+
+def download_tiktok_photo_scrape(url, base_path):
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
         r = requests.get(url, headers=headers, timeout=20)
@@ -235,6 +252,36 @@ def download_tiktok_photo(url, base_path):
                     except:
                         pass
     return downloaded
+
+def download_tiktok_photo_api(url, base_path):
+    try:
+        api = "https://tikwm.com/api/"
+        resp = requests.get(api, params={'url': url, 'hd': 1}, timeout=20)
+        data = resp.json()
+
+        downloaded = []
+        if data.get('code') == 0 and 'data' in data:
+            images = data['data'].get('images', [])
+            for i, img_url in enumerate(images):
+                if img_url:
+                    img_path = f"{base_path}_photo_{i+1}.jpg"
+                    img_data = requests.get(img_url, timeout=15).content
+                    with open(img_path, 'wb') as f:
+                        f.write(img_data)
+                    downloaded.append(img_path)
+
+            music_url = data['data'].get('music')
+            if music_url:
+                music_path = f"{base_path}_music.mp3"
+                music_data = requests.get(music_url, timeout=15).content
+                with open(music_path, 'wb') as f:
+                    f.write(music_data)
+                downloaded.append(music_path)
+
+        return downloaded
+    except Exception as e:
+        print("tikwm.com API fallback failed:", e)
+        return []
 
 # ====================== START BOT ======================
 
