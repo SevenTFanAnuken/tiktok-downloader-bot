@@ -32,7 +32,7 @@ if creds_json:
         gc = gspread.authorize(creds)
         sheet = gc.open("TiktokData").sheet1  # ← Change sheet name if needed
 
-        # AUTO-CREATE HEADERS IF MISSING
+        # Auto-create headers if missing
         headers = ["Timestamp", "User ID", "Username", "First Name", "TikTok Link", "Type", "Status"]
         current_headers = sheet.row_values(1)
         if not current_headers or current_headers != headers:
@@ -104,7 +104,7 @@ def handle_message(message):
 
     chat_id = message.chat.id
 
-    # Anti-duplicate
+    # Anti-duplicate check
     if chat_id in sent_cache and url in sent_cache[chat_id]:
         prev_msg_id = sent_cache[chat_id][url]
         bot.reply_to(message, "You already downloaded this one!", reply_to_message_id=prev_msg_id)
@@ -119,12 +119,14 @@ def handle_message(message):
         temp_path = f"downloads/{unique_id}"
         is_photo = "/photo/" in url
 
+        sent_msg = None
+
         if is_photo:
             bot.edit_message_text("Downloading photo slideshow…", chat_id, status_msg.message_id)
             files = download_tiktok_photo(url, temp_path)
 
             if not files:
-                raise Exception("No media found")
+                raise Exception("No media found in slideshow")
 
             zip_path = f"{temp_path}.zip"
             with zipfile.ZipFile(zip_path, 'w') as zf:
@@ -142,41 +144,70 @@ def handle_message(message):
             os.remove(zip_path)
             log_usage(message.from_user, url, "Photo Sent")
 
-        else:
+        else:  # Video
             bot.edit_message_text("Downloading video (no watermark)…", chat_id, status_msg.message_id)
 
-            ydl_opts = {
-                'outtmpl': f'{temp_path}.%(ext)s',
-                'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
-                'merge_output_format': 'mp4',
-                'quiet': True,
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-                'referer': 'https://www.tiktok.com/',
-            }
+            # Primary: yt-dlp (with cookies for sensitive content)
+            success = False
+            try:
+                ydl_opts = {
+                    'outtmpl': f'{temp_path}.%(ext)s',
+                    'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+                    'merge_output_format': 'mp4',
+                    'quiet': True,
+                    'cookiefile': 'cookies.txt',
+                    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+                    'referer': 'https://www.tiktok.com/',
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+                success = True
+            except Exception as e:
+                print("yt-dlp failed (possibly sensitive content):", e)
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-
-            for file in os.listdir('downloads'):
-                if file.startswith(unique_id):
-                    path = os.path.join('downloads', file)
-                    with open(path, 'rb') as video_file:
-                        sent_msg = bot.send_video(
-                            chat_id,
-                            video_file,
-                            caption=url,
-                            reply_to_message_id=message.message_id
-                        )
-                    os.remove(path)
-                    log_usage(message.from_user, url, "Video Sent")
-                    break
+            if success:
+                # Send video from yt-dlp
+                for file in os.listdir('downloads'):
+                    if file.startswith(unique_id):
+                        path = os.path.join('downloads', file)
+                        with open(path, 'rb') as video_file:
+                            sent_msg = bot.send_video(
+                                chat_id,
+                                video_file,
+                                caption=url,
+                                reply_to_message_id=message.message_id
+                            )
+                        os.remove(path)
+                        log_usage(message.from_user, url, "Video Sent (yt-dlp)")
+                        break
+                else:
+                    raise Exception("Video file not found after yt-dlp download")
             else:
-                raise Exception("Video file not found after download")
+                # Fallback: tikwm.com API
+                print("Trying tikwm.com API fallback for video...")
+                files = download_video_api_fallback(url, temp_path)
+                if not files or not files[0].endswith('.mp4'):
+                    raise Exception("API fallback failed or no video found")
 
-        # Cache sent message
-        if chat_id not in sent_cache:
+                video_path = files[0]
+                with open(video_path, 'rb') as video_file:
+                    sent_msg = bot.send_video(
+                        chat_id,
+                        video_file,
+                        caption=url,
+                        reply_to_message_id=message.message_id
+                    )
+                # Clean up all files from fallback
+                for f in files:
+                    if os.path.exists(f):
+                        os.remove(f)
+                log_usage(message.from_user, url, "Video Sent (API fallback)")
+
+        # Cache the sent message for duplicates
+        if sent_msg and chat_id not in sent_cache:
             sent_cache[chat_id] = {}
-        sent_cache[chat_id][url] = sent_msg.message_id
+        if sent_msg:
+            sent_cache[chat_id][url] = sent_msg.message_id
 
         bot.delete_message(chat_id, status_msg.message_id)
 
@@ -186,16 +217,13 @@ def handle_message(message):
         log_usage(message.from_user, url, f"Error: {error_text}")
         print("ERROR:", e)
 
-# ====================== PHOTO DOWNLOADER (Primary + API Fallback) ======================
+# ====================== PHOTO DOWNLOADER (Primary + Fallback) ======================
 
 def download_tiktok_photo(url, base_path):
-    # Primary: BeautifulSoup scraping
     files = download_tiktok_photo_scrape(url, base_path)
     if files:
         return files
-
-    # Fallback: tikwm.com API (very reliable in 2025)
-    print("Primary photo scrape failed → trying tikwm.com API fallback")
+    print("Primary scrape failed → trying tikwm.com API")
     return download_tiktok_photo_api(url, base_path)
 
 def download_tiktok_photo_scrape(url, base_path):
@@ -203,8 +231,7 @@ def download_tiktok_photo_scrape(url, base_path):
     try:
         r = requests.get(url, headers=headers, timeout=20)
         r.raise_for_status()
-    except Exception as e:
-        print("Photo page request failed:", e)
+    except:
         return []
 
     soup = BeautifulSoup(r.text, 'html.parser')
@@ -218,11 +245,9 @@ def download_tiktok_photo_scrape(url, base_path):
         pos = 0
         while True:
             pos = txt.find('https://', pos)
-            if pos == -1:
-                break
+            if pos == -1: break
             end = txt.find('"', pos)
-            if end == -1:
-                break
+            if end == -1: break
             img_url = unquote(txt[pos:end])
 
             if ('p16-sign' in img_url or 'p26-sign' in img_url) and img_url.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
@@ -232,8 +257,7 @@ def download_tiktok_photo_scrape(url, base_path):
                     with open(img_path, 'wb') as f:
                         f.write(img_data)
                     downloaded.append(img_path)
-                except:
-                    pass
+                except: pass
             pos = end
 
         if 'playUrl' in txt:
@@ -249,17 +273,15 @@ def download_tiktok_photo_scrape(url, base_path):
                         with open(music_path, 'wb') as f:
                             f.write(music_data)
                         downloaded.append(music_path)
-                    except:
-                        pass
+                    except: pass
     return downloaded
 
 def download_tiktok_photo_api(url, base_path):
     try:
-        api = "https://tikwm.com/api/"
-        resp = requests.get(api, params={'url': url, 'hd': 1}, timeout=20)
+        resp = requests.get("https://tikwm.com/api/", params={'url': url, 'hd': 1}, timeout=20)
         data = resp.json()
-
         downloaded = []
+
         if data.get('code') == 0 and 'data' in data:
             images = data['data'].get('images', [])
             for i, img_url in enumerate(images):
@@ -280,10 +302,40 @@ def download_tiktok_photo_api(url, base_path):
 
         return downloaded
     except Exception as e:
-        print("tikwm.com API fallback failed:", e)
+        print("Photo API fallback failed:", e)
+        return []
+
+# ====================== VIDEO API FALLBACK ======================
+
+def download_video_api_fallback(url, base_path):
+    try:
+        resp = requests.get("https://tikwm.com/api/", params={'url': url, 'hd': 1}, timeout=20)
+        data = resp.json()
+        downloaded = []
+
+        if data.get('code') == 0 and 'data' in data:
+            video_url = data['data'].get('play')  # No-watermark video
+            if video_url:
+                video_path = f"{base_path}_video.mp4"
+                video_data = requests.get(video_url, timeout=30).content
+                with open(video_path, 'wb') as f:
+                    f.write(video_data)
+                downloaded.append(video_path)
+
+            music_url = data['data'].get('music')
+            if music_url:
+                music_path = f"{base_path}_music.mp3"
+                music_data = requests.get(music_url, timeout=15).content
+                with open(music_path, 'wb') as f:
+                    f.write(music_data)
+                downloaded.append(music_path)
+
+        return downloaded
+    except Exception as e:
+        print("Video API fallback failed:", e)
         return []
 
 # ====================== START BOT ======================
 
-print("Bot started – waiting for links...")
+print("TikTok Downloader Bot is LIVE! (Robust video/photo + anti-spam)")
 bot.infinity_polling(none_stop=True)
