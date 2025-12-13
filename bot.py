@@ -1,4 +1,4 @@
-# bot.py - FINAL VERSION (December 2025)
+# bot.py
 import telebot
 import yt_dlp
 import os
@@ -11,42 +11,32 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import json
-import time
 
 # === TOKEN ===
 TOKEN = os.getenv('TOKEN')
 if not TOKEN:
-    print("FATAL: TOKEN not found in Railway Variables!")
+    print("FATAL: TOKEN not found! Add it in Railway Variables")
     exit()
+
 bot = telebot.TeleBot(TOKEN)
 
-# === GOOGLE SHEETS LOGGING (AUTO-CREATES HEADERS) ===
+# === GOOGLE SHEETS LOGGING ===
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds_json = os.getenv('GOOGLE_CREDENTIALS')
+logging_enabled = False
 
 if creds_json:
     try:
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json), scope)
+        creds_dict = json.loads(creds_json)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         gc = gspread.authorize(creds)
-        sh = gc.open("TiktokData")           # ← Change only if your sheet has a different name
-        sheet = sh.sheet1
-
-        # AUTO-CREATE HEADERS IF MISSING OR WRONG
-        headers = ["Timestamp", "User ID", "Username", "First Name", "TikTok Link", "Type", "Status"]
-        current_headers = sheet.row_values(1)
-        if not current_headers or current_headers != headers:
-            sheet.clear()
-            sheet.append_row(headers)
-            print("Google Sheet headers created automatically!")
-
+        sheet = gc.open("TiktokData").sheet1          # ← Change if needed
         logging_enabled = True
         print("Google Sheets logging ENABLED")
     except Exception as e:
-        print("Google Sheets failed:", e)
-        logging_enabled = False
+        print("Google Sheets setup FAILED:", str(e))
 else:
     print("No GOOGLE_CREDENTIALS → logging disabled")
-    logging_enabled = False
 
 def log_usage(user, url, status="Success"):
     if not logging_enabled:
@@ -62,56 +52,72 @@ def log_usage(user, url, status="Success"):
             status
         ]
         sheet.append_row(row)
-        print("Logged to sheet:", row)
     except Exception as e:
-        print("Sheet write failed:", e)
+        print("Sheet write error:", e)
 
 # Temporary folder
-if not os.path.exists('downloads'):
-    os.makedirs('downloads')
+os.makedirs('downloads', exist_ok=True)
 
-# ==================== COMMANDS ====================
+# === DUPLICATE PREVENTION CACHE ===
+# Format: {chat_id: {url: sent_message_id}}
+sent_cache = {}
+
+# ====================== COMMANDS ======================
 
 @bot.message_handler(commands=['start'])
-def send_welcome(message):
-    bot.reply_to(message, "Bot is waiting for the link\n\n"
-                          "Just send any TikTok link — I'll download it for you!")
+def cmd_start(message):
+    bot.reply_to(message, "Bot is waiting for the link\n"
+                         "Just send me any TikTok video or photo link!")
 
 @bot.message_handler(commands=['help'])
-def send_help(message):
-    bot.reply_to(message,
-        "Commands:\n"
-        "/start - Welcome\n"
-        "/help - This help\n"
-        "/issue - Contact @mnchetra\n\n"
-        "Just paste any TikTok link → I send video/photo with the link as caption!")
+def cmd_help(message):
+    help_text = (
+        "TikTok Downloader Bot Commands:\n\n"
+        "/start – Show welcome message\n"
+        "/help  – Show this help\n"
+        "/issue – Contact the developer if something is wrong\n\n"
+        "Just paste any TikTok link and I’ll send it without watermark!"
+    )
+    bot.reply_to(message, help_text)
 
 @bot.message_handler(commands=['issue'])
-def send_issue(message):
-    bot.reply_to(message, "Found a bug or need help?\nContact the developer: @mnchetra")
+def cmd_issue(message):
+    bot.reply_to(message, "For any issues or suggestions, please contact the developer: @mnchetra")
 
-# ==================== MAIN HANDLER ====================
+# ====================== MAIN HANDLER ======================
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     url = message.text.strip()
+
     if "tiktok.com" not in url:
         bot.reply_to(message, "Please send a valid TikTok link!")
         return
 
+    chat_id = message.chat.id
+
+    # Check for duplicate
+    if chat_id in sent_cache and url in sent_cache[chat_id]:
+        prev_msg_id = sent_cache[chat_id][url]
+        bot.reply_to(message, "You already downloaded this one!", reply_to_message_id=prev_msg_id)
+        log_usage(message.from_user, url, "Duplicate")
+        return
+
     log_usage(message.from_user, url, "Received")
-    status_msg = bot.reply_to(message, "Downloading...")
+    status_msg = bot.reply_to(message, "Processing your link…")
 
     try:
         unique_id = str(uuid.uuid4())
         temp_path = f"downloads/{unique_id}"
 
-        # === PHOTO POSTS ===
-        if "/photo/" in url:
-            bot.edit_message_text("Downloading photo(s)...", message.chat.id, status_msg.message_id)
-            files = download_tiktok_photo_robust(url, temp_path)
+        is_photo = "/photo/" in url
+
+        if is_photo:
+            bot.edit_message_text("Downloading photo slideshow…", chat_id, status_msg.message_id)
+            files = download_tiktok_photo(url, temp_path)
+
             if not files:
-                raise Exception("No photos found")
+                raise Exception("No media found in this slideshow")
 
             zip_path = f"{temp_path}.zip"
             with zipfile.ZipFile(zip_path, 'w') as zf:
@@ -120,75 +126,69 @@ def handle_message(message):
                     os.remove(f)
 
             with open(zip_path, 'rb') as z:
-                bot.send_document(message.chat.id, z, caption=url)
+                sent_msg = bot.send_document(
+                    chat_id,
+                    z,
+                    caption=url,
+                    reply_to_message_id=message.message_id
+                )
             os.remove(zip_path)
             log_usage(message.from_user, url, "Photo Sent")
 
-        # === VIDEO POSTS ===
         else:
-            success = False
-            for attempt in range(3):
-                try:
-                    bot.edit_message_text(f"Downloading video... (attempt {attempt+1}/3)", message.chat.id, status_msg.message_id)
-                    ydl_opts = {
-                        'outtmpl': f'{temp_path}.%(ext)s',
-                        'format': 'best[height<=720]/best',
-                        'merge_output_format': 'mp4',
-                        'quiet': True,
-                        'cookiefile': 'cookies.txt',
-                        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                        'referer': 'https://www.tiktok.com/',
-                        'sleep_interval': 2,
-                        'extractor_retries': 3,
-                    }
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([url])
+            bot.edit_message_text("Downloading video (no watermark)…", chat_id, status_msg.message_id)
 
-                    for file in os.listdir('downloads'):
-                        if file.startswith(unique_id):
-                            path = os.path.join('downloads', file)
-                            with open(path, 'rb') as video:
-                                bot.send_video(message.chat.id, video, caption=url)
-                            os.remove(path)
-                            success = True
-                            log_usage(message.from_user, url, "Video Sent")
-                            break
-                    if success:
-                        break
-                    time.sleep(3)
-                except Exception as e:
-                    if attempt == 2:
-                        raise e
+            ydl_opts = {
+                'outtmpl': f'{temp_path}.%(ext)s',
+                'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+                'merge_output_format': 'mp4',
+                'quiet': True,
+                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+                'referer': 'https://www.tiktok.com/',
+            }
 
-        bot.delete_message(message.chat.id, status_msg.message_id)
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+
+            for file in os.listdir('downloads'):
+                if file.startswith(unique_id):
+                    path = os.path.join('downloads', file)
+                    with open(path, 'rb') as video_file:
+                        sent_msg = bot.send_video(
+                            chat_id,
+                            video_file,
+                            caption=url,
+                            reply_to_message_id=message.message_id
+                        )
+                    os.remove(path)
+                    log_usage(message.from_user, url, "Video Sent")
+                    break
+            else:
+                raise Exception("Video file not found after download")
+
+        # Cache the sent message ID for this URL in this chat
+        if chat_id not in sent_cache:
+            sent_cache[chat_id] = {}
+        sent_cache[chat_id][url] = sent_msg.message_id
+
+        bot.delete_message(chat_id, status_msg.message_id)
 
     except Exception as e:
-        bot.reply_to(message, f"Download failed: {str(e)}\nTry again or use /issue")
-        log_usage(message.from_user, url, "Failed")
+        error_text = str(e) if len(str(e)) < 100 else str(e)[:97] + "..."
+        bot.edit_message_text(f"Failed: {error_text}\nTry again or use /issue", chat_id, status_msg.message_id)
+        log_usage(message.from_user, url, f"Error: {error_text}")
         print("ERROR:", e)
 
-# === BULLETPROOF PHOTO DOWNLOADER + API FALLBACK ===
-def download_tiktok_photo_robust(url, base_path, max_retries=3):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-    }
+# ====================== PHOTO DOWNLOADER ======================
 
-    for attempt in range(max_retries):
-        try:
-            r = requests.get(url, headers=headers, timeout=20)
-            r.raise_for_status()
-            break
-        except Exception as e:
-            print(f"Photo request failed (attempt {attempt+1}): {e}")
-            if attempt < max_retries - 1:
-                time.sleep(3)
-            else:
-                return download_photo_api_fallback(url, base_path)
+def download_tiktok_photo(url, base_path):
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    try:
+        r = requests.get(url, headers=headers, timeout=20)
+        r.raise_for_status()
+    except Exception as e:
+        print("Photo page request failed:", e)
+        return []
 
     soup = BeautifulSoup(r.text, 'html.parser')
     downloaded = []
@@ -198,75 +198,45 @@ def download_tiktok_photo_robust(url, base_path, max_retries=3):
             continue
         txt = script.string
 
-        # Extract images
         pos = 0
         while True:
             pos = txt.find('https://', pos)
-            if pos == -1: break
+            if pos == -1:
+                break
             end = txt.find('"', pos)
-            if end == -1: break
+            if end == -1:
+                break
             img_url = unquote(txt[pos:end])
+
             if ('p16-sign' in img_url or 'p26-sign' in img_url) and img_url.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
                 try:
                     img_data = requests.get(img_url, headers=headers, timeout=15).content
-                    img_path = f"{base_path}_photo_{len(downloaded)+1}.jpg"
+                    img_path = f"{base_path}_{len(downloaded)}.jpg"
                     with open(img_path, 'wb') as f:
                         f.write(img_data)
                     downloaded.append(img_path)
-                except: pass
+                except:
+                    pass
             pos = end
 
-        # Extract music
         if 'playUrl' in txt:
             pos = txt.find('"playUrl":"')
             if pos != -1:
                 pos += 11
                 end = txt.find('"', pos)
                 music_url = unquote(txt[pos:end])
-                if 'tiktokcdn.com' in music_url:
+                if 'tiktokcdn.com' in music_url or music_url.endswith('.mp3'):
                     try:
                         music_data = requests.get(music_url, headers=headers, timeout=15).content
                         music_path = f"{base_path}_music.mp3"
                         with open(music_path, 'wb') as f:
                             f.write(music_data)
                         downloaded.append(music_path)
-                    except: pass
+                    except:
+                        pass
+    return downloaded
 
-    if downloaded:
-        return downloaded
+# ====================== START BOT ======================
 
-    # Final fallback
-    return download_photo_api_fallback(url, base_path)
-
-def download_photo_api_fallback(url, base_path):
-    try:
-        api = "https://tikwm.com/api/"
-        resp = requests.get(api, params={'url': url, 'hd': 1}, timeout=15)
-        data = resp.json()
-        downloaded = []
-
-        if data.get('code') == 0 and 'data' in data:
-            images = data['data'].get('images', [])
-            for i, img_url in enumerate(images):
-                if img_url:
-                    img_path = f"{base_path}_photo_{i+1}.jpg"
-                    img_data = requests.get(img_url, timeout=15).content
-                    with open(img_path, 'wb') as f:
-                        f.write(img_data)
-                    downloaded.append(img_path)
-
-            music_url = data['data'].get('music')
-            if music_url:
-                music_path = f"{base_path}_music.mp3"
-                music = requests.get(music_url, timeout=15).content
-                with open(music_path, 'wb') as f:
-                    f.write(music)
-                downloaded.append(music_path)
-
-        return downloaded
-    except Exception as e:
-        print("API fallback failed:", e)
-        return []
-
-print("TikTok Downloader Bot is LIVE! (Auto headers + bulletproof)")
-bot.infinity_polling()
+print("Bot started – waiting for links...")
+bot.infinity_polling(none_stop=True)
