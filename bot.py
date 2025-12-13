@@ -240,4 +240,12 @@ def download_video_api_fallback(url, base_path):
 # ====================== START BOT ======================
 
 print("All-in-One TikTok + Instagram Downloader Bot is LIVE!")
+
+# Fix for 409 Conflict: Delete any active webhook before starting polling
+result = bot.delete_webhook()
+if result:
+    print("Webhook successfully deleted – now using polling mode")
+else:
+    print("Failed to delete webhook or no webhook was active")
+
 bot.infinity_polling(none_stop=True)
